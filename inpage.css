@@ -785,3 +785,76 @@
   font-size: 12px !important; color: rgba(240,240,240,0.7) !important;
   margin: 0 !important; line-height: 1.5 !important;
 }
+
+/* ── Seat occupancy above session times ──────────────────────────────── */
+
+.icm-occ-host {
+  position: relative !important;
+  margin-top: 16px !important;
+}
+
+.icm-occ {
+  position: absolute !important;
+  left: 2px !important;
+  right: 2px !important;
+  top: -15px !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 4px !important;
+  pointer-events: none !important;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important;
+  font-size: 10px !important;
+  font-weight: 700 !important;
+  line-height: 1 !important;
+  --icm-occ-color: #22c55e;
+}
+
+.icm-occ[data-level="medium"] { --icm-occ-color: #f59e0b; }
+.icm-occ[data-level="high"] { --icm-occ-color: #ef4444; }
+
+.icm-occ-num {
+  color: var(--icm-occ-color) !important;
+  flex-shrink: 0 !important;
+}
+
+.icm-occ-bar {
+  flex: 1 !important;
+  height: 4px !important;
+  border-radius: 2px !important;
+  background: rgba(255, 255, 255, 0.15) !important;
+  overflow: hidden !important;
+}
+
+.icm-occ-fill {
+  display: block !important;
+  height: 100% !important;
+  background: var(--icm-occ-color) !important;
+}
+
+/* Loading: shimmering bar and a placeholder number until the seat map arrives */
+
+.icm-occ[data-state="loading"] .icm-occ-num {
+  width: 18px !important;
+  height: 8px !important;
+  border-radius: 2px !important;
+  background: rgba(255, 255, 255, 0.15) !important;
+}
+
+.icm-occ[data-state="loading"] .icm-occ-fill {
+  width: 40% !important;
+  background: rgba(255, 255, 255, 0.35) !important;
+  animation: icm-occ-shimmer 1.1s ease-in-out infinite !important;
+}
+
+@keyframes icm-occ-shimmer {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(250%); }
+}
+
+.icm-occ[data-state="unavailable"] .icm-occ-num {
+  color: rgba(240, 240, 240, 0.4) !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .icm-occ[data-state="loading"] .icm-occ-fill { animation: none !important; }
+}

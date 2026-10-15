@@ -11,6 +11,9 @@
   const CITY_API = 'https://api-content.ingresso.com/v0/states/city/name';
   const NOMINATIM_API = 'https://nominatim.openstreetmap.org/search';
   const NOMINATIM_DELAY = 1100;
+  const SESSIONS_API = 'https://api.ingresso.com/v1/sessions';
+  const OCCUPANCY_CONCURRENCY = 3;
+  const OCCUPANCY_TTL = 3 * 60 * 1000;
 
   const DEFAULT_CITY = {
     id: '1',
@@ -257,6 +260,12 @@
     buildHouseNumberProbes,
     shouldRefineSuggestion
   } = globalThis.IcmGeocodeFormat;
+
+  const {
+    extractSessionId,
+    summarizeSeatMaps,
+    occupancyLevel
+  } = globalThis.IcmSeatOccupancy;
 
   const GEOCODE_PRECISION_RANK = {
     city: 1, 'cep-block': 2, cep: 3, 'house-near': 4, house: 5
@@ -2620,6 +2629,153 @@
     return panel;
   }
 
+  // ── Seat occupancy above session times ────────────────────────────────
+
+  const occupancyCache = new Map(); // sessionId → { at, summary } (summary may be null)
+  const occupancyQueue = [];
+  const occupancyQueued = new Set();
+  let occupancyActive = 0;
+  let occupancyObserver = null;
+
+  function sessionLinkButton(link) {
+    return link.closest('button') || link;
+  }
+
+  function findSessionLinks() {
+    return Array.from(document.querySelectorAll('a[href*="sessionId="]')).filter(link =>
+      !isExtensionDom(link)
+        && TIME_RE.test(link.textContent.trim())
+        && !sessionLinkButton(link).disabled
+    );
+  }
+
+  async function fetchJson(url) {
+    const res = await fetch(url, { credentials: 'omit' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  async function fetchSessionOccupancy(sessionId) {
+    const session = await fetchJson(`${SESSIONS_API}/${sessionId}`);
+    const sections = (session.sections || []).filter(s => s.hasSeatSelection !== false);
+    if (!session.hasSeatSelection || sections.length === 0) return null;
+    const maps = await Promise.all(sections.map(s =>
+      fetchJson(`${SESSIONS_API}/${sessionId}/sections/${encodeURIComponent(s.id)}/seats`)
+    ));
+    return summarizeSeatMaps(maps);
+  }
+
+  // Every enabled time gets a badge right away, in a loading state, so the
+  // row height is reserved before the seat map arrives.
+  function ensureOccupancyBadge(link) {
+    const button = sessionLinkButton(link);
+    let badge = button.querySelector(':scope > [data-icm-occ]');
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.setAttribute('data-icm-occ', '1');
+      badge.className = 'icm-occ';
+      badge.dataset.state = 'loading';
+      badge.innerHTML = '<span class="icm-occ-num"></span><span class="icm-occ-bar"><span class="icm-occ-fill"></span></span>';
+      button.classList.add('icm-occ-host');
+      button.appendChild(badge);
+    }
+    return badge;
+  }
+
+  function renderOccupancyBadges(sessionId) {
+    const entry = occupancyCache.get(sessionId);
+    if (!entry) return;
+
+    for (const link of findSessionLinks()) {
+      if (extractSessionId(link.href) !== sessionId) continue;
+      const badge = ensureOccupancyBadge(link);
+      const num = badge.querySelector('.icm-occ-num');
+      const fill = badge.querySelector('.icm-occ-fill');
+
+      if (!entry.summary) {
+        badge.dataset.state = 'unavailable';
+        num.textContent = '–';
+        fill.style.width = '0';
+        link.title = 'Ocupação da sala indisponível';
+        continue;
+      }
+
+      const { taken, capacity, percent } = entry.summary;
+      badge.dataset.state = 'ready';
+      badge.dataset.level = occupancyLevel(percent);
+      num.textContent = `${percent}%`;
+      fill.style.width = `${percent}%`;
+      link.title = `Sala ${percent}% ocupada (${taken} de ${capacity} lugares)`;
+    }
+  }
+
+  function pumpOccupancyQueue() {
+    while (occupancyActive < OCCUPANCY_CONCURRENCY && occupancyQueue.length > 0) {
+      const sessionId = occupancyQueue.shift();
+      occupancyActive += 1;
+      fetchSessionOccupancy(sessionId)
+        .then(summary => { occupancyCache.set(sessionId, { at: Date.now(), summary }); })
+        .catch(() => { occupancyCache.set(sessionId, { at: Date.now(), summary: null }); })
+        .finally(() => {
+          occupancyActive -= 1;
+          occupancyQueued.delete(sessionId);
+          renderOccupancyBadges(sessionId);
+          pumpOccupancyQueue();
+        });
+    }
+  }
+
+  function requestOccupancy(sessionId) {
+    const cached = occupancyCache.get(sessionId);
+    if (cached && Date.now() - cached.at < OCCUPANCY_TTL) {
+      renderOccupancyBadges(sessionId);
+      return;
+    }
+    if (occupancyQueued.has(sessionId)) return;
+    occupancyQueued.add(sessionId);
+    occupancyQueue.push(sessionId);
+    pumpOccupancyQueue();
+  }
+
+  // Only fetch seat maps for times the user can actually see.
+  function scanSessionLinks() {
+    for (const link of findSessionLinks()) {
+      ensureOccupancyBadge(link);
+      if (link.dataset.icmOccWatched) {
+        const sessionId = extractSessionId(link.href);
+        if (sessionId && occupancyCache.has(sessionId)) renderOccupancyBadges(sessionId);
+        continue;
+      }
+      link.dataset.icmOccWatched = '1';
+      occupancyObserver.observe(link);
+    }
+  }
+
+  function startSeatOccupancy() {
+    occupancyObserver = new IntersectionObserver(entries => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const sessionId = extractSessionId(entry.target.href);
+        if (sessionId) requestOccupancy(sessionId);
+      }
+    }, { rootMargin: '200px 0px' });
+
+    scanSessionLinks();
+
+    // React re-renders the session list on day changes; re-attach after it settles.
+    let debounce = null;
+    new MutationObserver(mutations => {
+      const relevant = mutations.some(m =>
+        [...m.addedNodes, ...m.removedNodes].some(n =>
+          n.nodeType === 1 && !isExtensionDom(n) && !n.matches('[data-icm-occ], [data-icm-dist]')
+        )
+      );
+      if (!relevant) return;
+      clearTimeout(debounce);
+      debounce = setTimeout(scanSessionLinks, 400);
+    }).observe(document.body, { childList: true, subtree: true });
+  }
+
   // ── Init ───────────────────────────────────────────────────────────────
 
   async function init() {
@@ -2639,6 +2795,7 @@
     }
 
     setupStickyToolbar();
+    startSeatOccupancy();
     await loadData();
 
     watchForDayChanges();
